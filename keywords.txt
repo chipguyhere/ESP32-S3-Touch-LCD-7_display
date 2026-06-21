@@ -1,0 +1,40 @@
+#######################################
+# Datatypes (KEYWORD1)
+#######################################
+
+ESP32S3_Touch_LCD_7	KEYWORD1
+ESP32S3_Touch_LCD_7_Touch	KEYWORD1
+TP_Point	KEYWORD1
+
+#######################################
+# Methods and Functions (KEYWORD2)
+#######################################
+
+begin	KEYWORD2
+setBacklight	KEYWORD2
+getFramebuffer	KEYWORD2
+width	KEYWORD2
+height	KEYWORD2
+copyPixels	KEYWORD2
+fillRect	KEYWORD2
+fillScreen	KEYWORD2
+drawPixel	KEYWORD2
+flush	KEYWORD2
+reset	KEYWORD2
+setRotation	KEYWORD2
+read	KEYWORD2
+
+#######################################
+# Constants (LITERAL1)
+#######################################
+
+GT911_ADDR1	LITERAL1
+GT911_ADDR2	LITERAL1
+ROTATION_LEFT	LITERAL1
+ROTATION_INVERTED	LITERAL1
+ROTATION_RIGHT	LITERAL1
+ROTATION_NORMAL	LITERAL1
+PIN_LCD_DE	LITERAL1
+PIN_LCD_VSYNC	LITERAL1
+PIN_LCD_HSYNC	LITERAL1
+PIN_LCD_PCLK	LITERAL1
