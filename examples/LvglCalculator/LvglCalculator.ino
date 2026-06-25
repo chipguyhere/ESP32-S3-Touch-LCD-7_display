@@ -45,7 +45,9 @@ void setup() {
     Serial0.begin(115200);
 
     // Initialize display, touch, and LVGL.  The UI adapts to whatever
-    // resolution the display reports.
+    // resolution the display reports, so try lv_setup.begin(90) or begin(270)
+    // for a portrait (480x800) calculator; begin(180) flips an upside-down
+    // panel.  See the README.
     lv_setup.begin();
     Serial0.printf("LVGL initialized with %dx%d touchscreen\n",
                    display.width(), display.height());

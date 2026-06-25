@@ -16,6 +16,9 @@
 #include "esp_heap_caps.h"
 #include "esp_cpu.h"
 #include "freertos/portmacro.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
 
 #include "esp_lcd_panel_rgb.h"
 #include "esp_lcd_panel_vendor.h"
@@ -122,9 +125,13 @@ volatile uint32_t g_isrCallCount = 0;     // Number of ISR calls
 //   - Removing the g_bbDesyncCount / g_bbDiag_* externs from the header
 // ---------------------------------------------------------------------------
 volatile uint32_t g_bbDesyncCount = 0;    // Number of desync events detected
-static volatile uint32_t* s_gdma_out_dscr_reg = nullptr;  // Pointer to GDMA TX out.dscr register
-static void* s_bb_addrs[2] = {nullptr, nullptr};           // Learned bounce buffer addresses
-static size_t s_bb_size = 0;                                // Bounce buffer size in bytes
+volatile uint32_t g_bbDroppedCount = 0;   // Fill requests dropped (queue full -> task fell behind)
+
+// These three are used only by the desync workaround (LCD7_BOUNCE_DESYNC_WORKAROUND);
+// marked unused so they don't warn when it is compiled out (the default).
+static volatile uint32_t* s_gdma_out_dscr_reg __attribute__((unused)) = nullptr;  // GDMA TX out.dscr register
+static void* s_bb_addrs[2] __attribute__((unused)) = {nullptr, nullptr};           // Learned bounce buffer addresses
+static size_t s_bb_size __attribute__((unused)) = 0;                               // Bounce buffer size in bytes
 
 // Diagnostic: last values seen by ISR (readable from main loop for debugging)
 volatile uint32_t g_bbDiag_dscr = 0;        // Last descriptor address read from GDMA
@@ -306,8 +313,195 @@ static void renderNoPsramMessage(uint16_t* dst, int pos_px, int pixel_count, int
     }
 }
 
-// Bounce buffer callback - copies pixels from PSRAM framebuffer to bounce buffer
-// Uses linear ring buffer addressing: each screen row is contiguous, only wraps at buffer end
+// ---------------------------------------------------------------------------
+// ISR -> fill-task hand-off
+// ---------------------------------------------------------------------------
+// The GDMA "bounce buffer empty" callback runs in ISR context.  To keep that
+// ISR short (so it does not block other interrupts on its core), it does only
+// the cheap, time-critical work -- frame-start latching, desync detection and
+// the flash-overlay fill -- and hands the heavy PSRAM->bounce-buffer copy to a
+// dedicated high-priority task via this request queue.  Each request snapshots
+// the per-frame state (which framebuffer, which scroll offset) so the copy is
+// consistent even if the task runs a little behind.
+struct BounceFillRequest {
+    void*     bounce_buf;     // target bounce buffer (already desync-redirected)
+    int       pos_px;         // linear screen pixel position this chunk starts at
+    int       len_bytes;      // bytes to fill
+    uint16_t* framebuffer;    // active framebuffer to copy from (non-null)
+    uint32_t  scroll_offset;  // scroll offset latched for this frame
+    uint32_t  gen;            // chunk generation (cooperative mode; else unused)
+};
+
+// Bounce-buffer pointer-validation / desync redirect workaround.
+//   0 (default) = trust the bounce_buf pointer the ESP-IDF RGB driver hands us.
+//   1           = detect the driver's ping-pong phase inversion and redirect the
+//                 fill to the idle buffer (see extras/DESYNC_WORKAROUND.md for the
+//                 full technique and history -- it took real effort to get right).
+// Disabled by default because the GDMA-channel extraction it needs reads a
+// private esp_rgb_panel_t struct mirror whose layout is ESP-IDF-version-specific;
+// on the core this was last built against (IDF 5.5.4) that read returned a null
+// dma_chan.  The artifact it guards against is obvious on-screen (streaking that
+// races the scan, typically after flash writes), so flip this back on -- and fix
+// the struct offset per extras/DESYNC_WORKAROUND.md -- if it ever returns.
+#ifndef LCD7_BOUNCE_DESYNC_WORKAROUND
+#define LCD7_BOUNCE_DESYNC_WORKAROUND 0
+#endif
+
+// Where the PSRAM->bounce-buffer copy runs.
+//   1 (default) = deferred to a dedicated high-priority task, so the GDMA ISR
+//                 stays short (it only hands off the request) and doesn't block
+//                 other interrupts on its core.  This is the normal mode.
+//   0           = inline in the GDMA ISR, like the 2.8C driver -- runs the copy
+//                 synchronously at the bounce-empty moment.  Also used as the
+//                 automatic fallback if the task/queue can't be created.
+// (Watch g_bbDroppedCount in task mode: a non-zero, climbing value means the
+// fill task isn't keeping up with the refresh.)
+#ifndef LCD7_BOUNCE_FILL_IN_TASK
+#define LCD7_BOUNCE_FILL_IN_TASK 1
+#endif
+
+// NOTE: a GDMA (esp_async_memcpy) offload of this copy was tried and removed.  It
+// could not meet the per-bounce-buffer deadline: the bounce mechanism is strictly
+// serial (two buffers, one always being scanned out, so only the just-freed one
+// can be filled -- no room to pipeline), and GDMA reaches PSRAM through the same
+// cache as the CPU, so it is no faster than the CPU's prefetched/burst cached read
+// while adding per-chunk write-back (cache coherency), submit, and completion-wake
+// overhead.  Measured ~9% of chunks dropped vs 0% for the CPU copy.  The CPU fill
+// below is the right tool on the ESP32-S3.  (A separate ESP32-P4 driver, which has
+// an independent AXI DMA + 2D copy engine, does this differently and performs well.)
+
+// The bounce-fill task runs at a very high priority, pinned to the core that
+// owns the RGB panel, so it can meet the per-bounce-buffer deadline (it must
+// finish before the DMA wraps back to the buffer it is filling).  Lower it if it
+// starves other work on that core.
+#define LCD7_BOUNCE_TASK_PRIORITY (configMAX_PRIORITIES - 1)
+// Depth of the ISR->task hand-off queue.  There are only two bounce buffers, so
+// a few slots absorb scheduling jitter; an overflow (counted in g_bbDroppedCount)
+// means the task could not keep up with the refresh.
+#define LCD7_BOUNCE_QUEUE_LEN 8
+
+// Which core runs the bounce-fill task.
+//   0 (default) = the same core as begin() (and the GDMA ISR), so the ISR->task
+//                 hand-off is a same-core wakeup with the least latency.  That
+//                 core (typically the Arduino APP CPU, core 1) is also running
+//                 LVGL / loop(), so the copy shares it with the UI work -- which
+//                 is fine: the CPU copy meets the ~1 ms deadline with margin.
+//   1           = the OTHER core, moving the per-frame copy off the UI core.
+//                 Costs a cross-core wakeup (a few microseconds, well within the
+//                 deadline) but lets LVGL keep the begin() core to itself.
+//
+//                 *** WiFi / Bluetooth WARNING ***  The "other" core is normally
+//                 the PRO CPU (core 0), where the WiFi driver and the Bluetooth
+//                 controller live.  This fill task is configMAX_PRIORITIES-1
+//                 (above the WiFi task) and uses ~45% of a core (~936 wakeups/s),
+//                 so pinning it to core 0 will degrade WiFi throughput/latency and
+//                 can break Bluetooth's hard real-time radio timing (glitches /
+//                 drops).  Only enable this if the radio is unused -- or lower
+//                 LCD7_BOUNCE_TASK_PRIORITY below the radio tasks (accepting some
+//                 drop risk) if you truly need both.
+#ifndef LCD7_BOUNCE_FILL_OTHER_CORE
+#define LCD7_BOUNCE_FILL_OTHER_CORE 0
+#endif
+
+// ---------------------------------------------------------------------------
+// Cooperative dual-core bounce fill (EXPERIMENTAL, opt-in; default OFF).
+//
+// Goal: use the PRO/WiFi core's spare time for the per-frame copy WITHOUT ever
+// compromising WiFi/BT or missing the bounce deadline.
+//   - A LOW-priority worker on the other (PRO) core does the copy opportunistically.
+//     Low priority => WiFi/BT always preempt it => the radio is protected.
+//   - A free-running checkpoint timer fires partway through each chunk's window.
+//     If the worker hasn't finished (it got preempted by the radio), the timer
+//     wakes a HIGH-priority backstop task on the app core to finish the remainder.
+//   - Both advance ONE shared atomic cursor over the chunk.  Copying the same
+//     stable source to the same destination is idempotent, so overlapping work
+//     during a hand-over is harmless (no torn pixels), and a compare-and-swap on
+//     the cursor is exactly "did the other core move it?" -- the loser just bows out.
+//
+// Covers the common case (no scroll, stride == width -- what the examples use);
+// other configs fall back to a whole-chunk fill on the worker.  Sprites are drawn
+// once by whichever core finishes the base copy.
+//
+// *** UNTESTED in this environment (no hardware/toolchain here) -- bring up on
+//     device and watch g_bbDroppedCount under a WiFi load. ***
+//
+// Flash-write note: the checkpoint timer's ISR touches only internal SRAM (it
+// reads the cursor and notifies a task -- no PSRAM), so it is safe provided its
+// ISR runs from IRAM (enable CONFIG_GPTIMER_ISR_IRAM_SAFE if the app writes flash
+// at runtime; the bundled demos do not).  The worker/backstop are tasks, so they
+// never run during a flash write, like the default fill task.
+#ifndef LCD7_BOUNCE_FILL_COOP
+#define LCD7_BOUNCE_FILL_COOP 0
+#endif
+
+#ifndef LCD7_COOP_BLOCK_PX
+#define LCD7_COOP_BLOCK_PX 512      // pixels copied per claimed block (CAS granularity)
+#endif
+#ifndef LCD7_COOP_CHECKPOINT_US
+#define LCD7_COOP_CHECKPOINT_US 500 // how long to let the worker try before backstop helps
+#endif
+#ifndef LCD7_COOP_TICK_US
+#define LCD7_COOP_TICK_US 150       // checkpoint-timer period
+#endif
+#ifndef LCD7_COOP_WORKER_PRIORITY
+#define LCD7_COOP_WORKER_PRIORITY 2 // low (above idle, below the WiFi/BT tasks)
+#endif
+
+#if LCD7_BOUNCE_FILL_COOP
+#include <atomic>
+#include "driver/gptimer.h"
+
+// Parameters of the chunk currently being filled (set by the bounce ISR).  Plain
+// struct in internal RAM; the generation counter publishes it (see _coopDrive).
+struct CoopChunk {
+    void*     bounce_buf;
+    uint16_t* framebuffer;
+    int       pos_px;
+    int       pixel_count;
+    int       rev_base;      // 180: output px j <- framebuffer[rev_base - j]
+    bool      rotate180;
+    bool      coop_ok;       // scroll==0 && stride==width (else worker does whole fill)
+};
+static CoopChunk g_coop;
+static std::atomic<uint32_t> g_coopCursor{0};   // next output pixel to copy
+static volatile uint32_t g_coopGen = 0;         // bumped per chunk; old workers bail
+static volatile uint32_t g_coopStartCcount = 0; // CPU cycle count at chunk start
+static volatile uint32_t g_coopThreshCycles = 0;// LCD7_COOP_CHECKPOINT_US in cycles
+static volatile bool      g_coopActive = false; // a coop chunk is in flight
+static gptimer_handle_t   g_coopTimer = nullptr;
+static TaskHandle_t       g_coopBackstop = nullptr;
+
+// Copy output pixels [j0, j0+n) of chunk `c`.  Runs in task context only (worker
+// or backstop), so PSRAM access and memcpy are fine.  Reads PSRAM forward in both
+// orientations (the 180 case writes the SRAM side in reverse).
+static void coopCopyBlock(const CoopChunk& c, int j0, int n) {
+    uint16_t* dst = (uint16_t*)c.bounce_buf;
+    if (!c.rotate180) {
+        memcpy(dst + j0, c.framebuffer + c.pos_px + j0, (size_t)n * sizeof(uint16_t));
+    } else {
+        // output px (j0 .. j0+n-1) <- framebuffer[rev_base - j]; read the source
+        // run forward and write the destination reversed.
+        const uint16_t* sf = c.framebuffer + (c.rev_base - (j0 + n - 1));
+        for (int k = 0; k < n; k++) dst[j0 + (n - 1 - k)] = sf[k];
+    }
+}
+
+// Checkpoint timer ISR: SRAM-only.  If the worker is past the grace period but
+// the chunk isn't done, wake the app-core backstop.  Touches no PSRAM.
+static bool IRAM_ATTR coopTimerCb(gptimer_handle_t, const gptimer_alarm_event_data_t*, void*) {
+    if (!g_coopActive) return false;
+    if (g_coopCursor.load(std::memory_order_relaxed) >= (uint32_t)g_coop.pixel_count) return false;
+    uint32_t now = esp_cpu_get_cycle_count();
+    if ((now - g_coopStartCcount) < g_coopThreshCycles) return false;  // give the worker more time
+    BaseType_t hpw = pdFALSE;
+    if (g_coopBackstop) vTaskNotifyGiveFromISR(g_coopBackstop, &hpw);
+    return hpw == pdTRUE;
+}
+#endif // LCD7_BOUNCE_FILL_COOP
+
+// Bounce buffer callback - runs in ISR context (GDMA "bounce empty" interrupt).
+// Does the cheap, time-critical work inline and defers the PSRAM copy to the
+// high-priority fill task.  See the block comment above.
 bool IRAM_ATTR bounceBufferFillCallback(esp_lcd_panel_handle_t panel, void *bounce_buf,
                                                 int pos_px, int len_bytes, void *user_ctx) {
     uint32_t entry_time = esp_cpu_get_cycle_count();
@@ -320,8 +514,16 @@ bool IRAM_ATTR bounceBufferFillCallback(esp_lcd_panel_handle_t panel, void *boun
 
     ESP32S3_Touch_LCD_7* display = (ESP32S3_Touch_LCD_7*)user_ctx;
 
+#if LCD7_BOUNCE_DESYNC_WORKAROUND
     // --- Begin bounce buffer desync detection and workaround ---
-    // (See block comment above for full explanation; removable if ESP-IDF fixes this)
+    // (See extras/DESYNC_WORKAROUND.md for the full explanation and history.)
+    //
+    // This MUST stay in the ISR, not the fill task: it reads the GDMA descriptor
+    // register at notification time, which is exactly when the driver's
+    // ping-pong phase inversion is detectable.  Deferring it to the task would
+    // also mistake mere task lateness (DMA reading our buffer because we are slow)
+    // for a phase inversion.  It is cheap -- one MMIO read and a compare -- and
+    // touches no PSRAM/flash, so it is safe in the ISR.
 
     // Learn both bounce buffer addresses from the first two distinct callback invocations
     if (s_bb_addrs[0] == nullptr) {
@@ -334,7 +536,6 @@ bool IRAM_ATTR bounceBufferFillCallback(esp_lcd_panel_handle_t panel, void *boun
     // then extract the buffer address from that descriptor (word 1 of the DMA descriptor).
     // If the DMA's active buffer is the same one we've been asked to fill, the driver's
     // ping-pong phase is inverted -- redirect our writes to the other (idle) buffer.
-    bool desync = false;
     if (s_gdma_out_dscr_reg != nullptr && s_bb_size > 0) {
         uint32_t dscr_addr = *s_gdma_out_dscr_reg;
         g_bbDiag_dscr = dscr_addr;
@@ -346,7 +547,6 @@ bool IRAM_ATTR bounceBufferFillCallback(esp_lcd_panel_handle_t panel, void *boun
             uint32_t bb_start = (uint32_t)bounce_buf;
             uint32_t bb_end = bb_start + s_bb_size;
             if (dma_buf_addr >= bb_start && dma_buf_addr < bb_end) {
-                desync = true;
                 g_bbDesyncCount = g_bbDesyncCount + 1;
                 // Redirect writes to the other bounce buffer since this one is in-flight
                 if (s_bb_addrs[0] != nullptr && s_bb_addrs[1] != nullptr) {
@@ -356,6 +556,7 @@ bool IRAM_ATTR bounceBufferFillCallback(esp_lcd_panel_handle_t panel, void *boun
         }
     }
     // --- End bounce buffer desync detection and workaround ---
+#endif // LCD7_BOUNCE_DESYNC_WORKAROUND
 
     // At frame start (pos_px == 0), copy pending values to active
     // This provides tear-free scrolling/swapping by only changing at frame boundaries
@@ -387,6 +588,11 @@ bool IRAM_ATTR bounceBufferFillCallback(esp_lcd_panel_handle_t panel, void *boun
     // Flash write overlay: if active, fill bounce buffer with black background
     // and expand the 1bpp SRAM bitmap for message rows that overlap this chunk.
     // Row-by-row copy from SRAM only -- no PSRAM or flash access.
+    //
+    // This path MUST stay in the ISR (not the fill task): it runs during flash
+    // writes, when the cache is disabled and no FreeRTOS task can be scheduled.
+    // It only touches SRAM, so the IRAM-safe ISR can execute it throughout the
+    // stall -- which is the whole reason the overlay exists.
     const volatile uint8_t* flashBmp = s_flashMsgActive;
     if (flashBmp != nullptr) {
         uint16_t* dst = (uint16_t*)bounce_buf;
@@ -410,97 +616,256 @@ bool IRAM_ATTR bounceBufferFillCallback(esp_lcd_panel_handle_t panel, void *boun
         int msgH = s_flashMsgH;
         int stride = s_flashMsgStride;
         bool tile = s_flashMsgTile;
+        // Under 180-degree rotation the overlay is flipped so the text reads
+        // upright on the inverted panel: each physical line maps to logical line
+        // (H-1-scr_y) and each message column to physical x (W-1-(msgX+x)).
+        bool rot = display->_rotate180;
         for (int line = 0; line < num_lines; line++) {
-            int scr_y = start_y + line;
+            int scr_y = start_y + line;                                  // physical line
+            int ly = rot ? (ESP32S3_Touch_LCD_7::_height - 1 - scr_y)    // logical line
+                         : scr_y;
             int rel_y;
             if (tile) {
                 // Tile: use position within the bounce buffer band, offset by msgY
                 // which is the offset within a band (set by beginFlashMessage)
-                int band_y = scr_y % num_lines;
+                int band_y = ly % num_lines;
                 rel_y = band_y - msgY;
             } else {
-                rel_y = scr_y - msgY;
+                rel_y = ly - msgY;
             }
             if (rel_y < 0 || rel_y >= msgH) continue;
             const volatile uint8_t* src_row = flashBmp + rel_y * stride;
-            uint16_t* dst_row = dst + line * screen_width + msgX;
             for (int x = 0; x < msgW; x++) {
                 if (src_row[x / 8] & (0x80 >> (x % 8))) {
-                    dst_row[x] = 0xFFFF;
+                    int phys_x = rot ? (screen_width - 1 - (msgX + x)) : (msgX + x);
+                    dst[line * screen_width + phys_x] = 0xFFFF;
                 }
             }
         }
         return false;
     }
 
-    const uint32_t scroll_offset = display->_scroll_offset;
-    const uint32_t fb_size = display->_fb_size;
-    const int fb_stride = display->_fb_stride;
-
-    uint16_t* dst = (uint16_t*)bounce_buf;
-    int pixel_count = len_bytes / sizeof(uint16_t);
-
-    // Screen position from linear pos_px
-    int screen_y = pos_px / screen_width;
-    int screen_x = pos_px % screen_width;
-
-    // Linear framebuffer position: scroll_offset + screen_y * fb_stride + screen_x
-    // Each screen row is contiguous (800 pixels), with fb_stride spacing between rows
-    while (pixel_count > 0) {
-        // Compute linear position in framebuffer
-        uint32_t fb_pos = (scroll_offset + screen_y * fb_stride + screen_x) % fb_size;
-        uint16_t* src = framebuffer + fb_pos;
-
-        // How many pixels until end of screen row or buffer wrap?
-        int pixels_to_row_end = screen_width - screen_x;
-        int pixels_to_wrap = fb_size - fb_pos;
-        int segment = pixels_to_row_end;
-        if (pixels_to_wrap < segment) segment = pixels_to_wrap;
-        if (pixel_count < segment) segment = pixel_count;
-
-        // Copy segment using 32-bit operations
-        int remaining = segment;
-
-        // Align dst if needed
-        if (((uintptr_t)dst & 2) && remaining > 0) {
-            *dst++ = *src++;
-            remaining--;
+    // Normal operation: hand the heavy PSRAM->bounce-buffer copy (and sprite
+    // overlay) to the high-priority fill task.  The desync redirect above has
+    // already chosen the target buffer; snapshot the per-frame state so the copy
+    // is consistent even if the task runs slightly behind.
+    BaseType_t hpw = pdFALSE;
+    if (display->_bounceQueue != nullptr) {
+        BounceFillRequest req;
+        req.bounce_buf    = bounce_buf;
+        req.pos_px        = pos_px;
+        req.len_bytes     = len_bytes;
+        req.framebuffer   = framebuffer;
+        req.scroll_offset = display->_scroll_offset;
+        req.gen           = 0;
+#if LCD7_BOUNCE_FILL_COOP
+        // Publish this chunk for the cooperative worker + backstop.  Bump the
+        // generation FIRST so any worker still on the previous chunk bails before
+        // we overwrite the params; then set params and reset the shared cursor.
+        {
+            int pixel_count = len_bytes / sizeof(uint16_t);
+            bool coop_ok = (display->_scroll_offset == 0) &&
+                           (display->_fb_stride == ESP32S3_Touch_LCD_7::_width);
+            g_coopActive = false;                       // pause the checkpoint timer
+            uint32_t g = g_coopGen + 1;
+            g_coopGen = g;
+            g_coop.bounce_buf  = bounce_buf;
+            g_coop.framebuffer = framebuffer;
+            g_coop.pos_px      = pos_px;
+            g_coop.pixel_count = pixel_count;
+            g_coop.rotate180   = display->_rotate180;
+            g_coop.coop_ok     = coop_ok;
+            g_coop.rev_base    = ESP32S3_Touch_LCD_7::_width *
+                                 ESP32S3_Touch_LCD_7::_height - pos_px - 1;
+            g_coopCursor.store(0, std::memory_order_release);
+            g_coopStartCcount  = entry_time;
+            g_coopActive       = coop_ok;               // timer only acts on coop chunks
+            req.gen            = g;
         }
+#endif
+        if (xQueueSendFromISR(display->_bounceQueue, &req, &hpw) != pdTRUE) {
+            // Queue full: the fill task could not keep up.  The buffer keeps its
+            // previous contents this pass (a transient glitch); count it.
+            g_bbDroppedCount = g_bbDroppedCount + 1;
+        }
+    } else {
+        // Fallback (no fill task -- creation failed): do the copy inline, as the
+        // original driver did.  Safe during normal operation (cache enabled).
+        display->_fillBounceBuffer(bounce_buf, pos_px, len_bytes, framebuffer,
+                                   display->_scroll_offset);
+    }
 
-        // Align src if needed
-        if (((uintptr_t)src & 2) && remaining > 0) {
-            *dst++ = *src++;
-            remaining--;
-        }
+    // Accumulate time spent inside ISR and record exit time
+    uint32_t exit_time = esp_cpu_get_cycle_count();
+    g_isrCyclesIn += (exit_time - entry_time);
+    g_isrLastExit = exit_time;
 
-        // Now both are 32-bit aligned - fast copy
-        uint32_t* src32 = (uint32_t*)src;
-        uint32_t* dst32 = (uint32_t*)dst;
-        while (remaining >= 8) {
-            dst32[0] = src32[0];
-            dst32[1] = src32[1];
-            dst32[2] = src32[2];
-            dst32[3] = src32[3];
-            src32 += 4;
-            dst32 += 4;
-            remaining -= 8;
-        }
-        while (remaining >= 2) {
-            *dst32++ = *src32++;
-            remaining -= 2;
-        }
-        dst = (uint16_t*)dst32;
-        if (remaining) {
-            *dst++ = *(uint16_t*)src32;
-        }
+    return hpw == pdTRUE;
+}
 
-        pixel_count -= segment;
-        screen_x += segment;
-        if (screen_x >= screen_width) {
-            screen_x = 0;
-            screen_y++;
+// The high-priority task that drains the request queue and performs the actual
+// PSRAM->bounce-buffer copy + sprite overlay.  Runs in task context (cache
+// enabled), so it never executes during a flash write -- those frames are
+// handled entirely by the ISR's flash-overlay path above.
+void ESP32S3_Touch_LCD_7::_bounceFillTask(void* arg) {
+    ESP32S3_Touch_LCD_7* self = (ESP32S3_Touch_LCD_7*)arg;
+    BounceFillRequest req;
+    for (;;) {
+        if (xQueueReceive(self->_bounceQueue, &req, portMAX_DELAY) == pdTRUE) {
+            self->_fillBounceBuffer(req.bounce_buf, req.pos_px, req.len_bytes,
+                                    req.framebuffer, req.scroll_offset);
         }
     }
+}
+
+// Copy one bounce-buffer-worth of pixels from the PSRAM framebuffer, then draw
+// any sprites that overlap this chunk.  This is the heavy work; by default it
+// runs inline in the GDMA ISR (LCD7_BOUNCE_FILL_IN_TASK==0), or in _bounceFillTask
+// when that is enabled.  The caller has already done frame-start latching and the
+// no-PSRAM / flash-overlay checks.  Marked IRAM_ATTR so the ISR-inline path runs
+// from IRAM (deterministic timing, no i-cache miss) -- harmless for the task path.
+void IRAM_ATTR ESP32S3_Touch_LCD_7::_fillBounceBuffer(void* bounce_buf, int pos_px, int len_bytes,
+                                            uint16_t* framebuffer, uint32_t scroll_offset) {
+    const int screen_width = ESP32S3_Touch_LCD_7::_width;
+    const uint32_t fb_size = _fb_size;
+    const int fb_stride = _fb_stride;
+
+    int pixel_count = len_bytes / sizeof(uint16_t);
+
+    if (!_rotate180) {
+        // ---- Normal orientation: read PSRAM forward, write bounce forward ----
+        uint16_t* dst = (uint16_t*)bounce_buf;
+
+        // Screen position from linear pos_px
+        int screen_y = pos_px / screen_width;
+        int screen_x = pos_px % screen_width;
+
+        // Linear framebuffer position: scroll_offset + screen_y * fb_stride + screen_x
+        // Each screen row is contiguous (800 pixels), with fb_stride spacing between rows
+        while (pixel_count > 0) {
+            // Compute linear position in framebuffer
+            uint32_t fb_pos = (scroll_offset + screen_y * fb_stride + screen_x) % fb_size;
+            uint16_t* src = framebuffer + fb_pos;
+
+            // How many pixels until end of screen row or buffer wrap?
+            int pixels_to_row_end = screen_width - screen_x;
+            int pixels_to_wrap = fb_size - fb_pos;
+            int segment = pixels_to_row_end;
+            if (pixels_to_wrap < segment) segment = pixels_to_wrap;
+            if (pixel_count < segment) segment = pixel_count;
+
+            // Copy segment using 32-bit operations
+            int remaining = segment;
+
+            // Align dst if needed
+            if (((uintptr_t)dst & 2) && remaining > 0) {
+                *dst++ = *src++;
+                remaining--;
+            }
+
+            // Align src if needed
+            if (((uintptr_t)src & 2) && remaining > 0) {
+                *dst++ = *src++;
+                remaining--;
+            }
+
+            // Now both are 32-bit aligned - fast copy
+            uint32_t* src32 = (uint32_t*)src;
+            uint32_t* dst32 = (uint32_t*)dst;
+            while (remaining >= 8) {
+                dst32[0] = src32[0];
+                dst32[1] = src32[1];
+                dst32[2] = src32[2];
+                dst32[3] = src32[3];
+                src32 += 4;
+                dst32 += 4;
+                remaining -= 8;
+            }
+            while (remaining >= 2) {
+                *dst32++ = *src32++;
+                remaining -= 2;
+            }
+            dst = (uint16_t*)dst32;
+            if (remaining) {
+                *dst++ = *(uint16_t*)src32;
+            }
+
+            pixel_count -= segment;
+            screen_x += segment;
+            if (screen_x >= screen_width) {
+                screen_x = 0;
+                screen_y++;
+            }
+        }
+    } else {
+        // ---- 180-degree rotation ----
+        // Physical pixel p must show logical pixel (total-1-p).  Read PSRAM
+        // FORWARD from the opposite end of the screen (cache-friendly sequential
+        // access -- the whole point), and write the SRAM bounce buffer BACKWARD.
+        // Only the cheap SRAM side runs in reverse; PSRAM stays sequential.
+        const int total_screen_pixels = screen_width * ESP32S3_Touch_LCD_7::_height;
+        int rotated_pos = total_screen_pixels - pos_px - pixel_count;
+        int screen_y = rotated_pos / screen_width;
+        int screen_x = rotated_pos % screen_width;
+
+        // dst starts at the end of the bounce buffer and decrements
+        uint16_t* dst = (uint16_t*)bounce_buf + pixel_count - 1;
+
+        while (pixel_count > 0) {
+            uint32_t fb_pos = (scroll_offset + screen_y * fb_stride + screen_x) % fb_size;
+            uint16_t* src = framebuffer + fb_pos;
+
+            // How many pixels until end of screen row or buffer wrap?
+            int pixels_to_row_end = screen_width - screen_x;
+            int pixels_to_wrap = fb_size - fb_pos;
+            int segment = pixels_to_row_end;
+            if (pixels_to_wrap < segment) segment = pixels_to_wrap;
+            if (pixel_count < segment) segment = pixel_count;
+
+            // Read forward from PSRAM, write backward to SRAM.
+            //
+            // Fast path: read a 32-bit word (two pixels) forward and store it
+            // reversed at the mirrored position.  On little-endian, a word is
+            // (src[i+1]<<16 | src[i]); the mirrored destination word must be
+            // (src[i]<<16 | src[i+1]) -- i.e. a 16-bit halfword rotate of the
+            // word -- so we still read PSRAM forward in 32-bit bursts and halve
+            // the load/store count.  Requires src word-aligned AND the
+            // destination word base (dst-1) word-aligned (the mirror makes this a
+            // dual constraint); otherwise fall back to the scalar loop below.
+            int i = 0;
+            if ((((uintptr_t)src & 3) == 0) && (((uintptr_t)(dst - 1) & 3) == 0)) {
+                const uint32_t* s32 = (const uint32_t*)src;
+                uint32_t* d32 = (uint32_t*)(dst - 1);  // base of first mirrored word
+                int pairs = segment >> 1;
+                for (int p = 0; p < pairs; p++) {
+                    uint32_t x = s32[p];
+                    d32[-p] = (x >> 16) | (x << 16);   // swap the two pixels
+                }
+                i = pairs << 1;
+                dst -= i;                              // advance past the batched pixels
+            }
+            // Scalar remainder (and the whole segment when unaligned)
+            for (; i < segment; i++) {
+                *dst-- = src[i];
+            }
+
+            pixel_count -= segment;
+            screen_x += segment;
+            if (screen_x >= screen_width) {
+                screen_x = 0;
+                screen_y++;
+            }
+        }
+    }
+
+    // Draw any sprites that overlap this chunk (shared with the DMA fill path).
+    _overlaySprites(bounce_buf, pos_px, len_bytes);
+}
+
+// Overlay active sprites onto a freshly-filled bounce buffer.  Split out of
+// _fillBounceBuffer so the GDMA fill path can reuse it after the DMA copy.
+void IRAM_ATTR ESP32S3_Touch_LCD_7::_overlaySprites(void* bounce_buf, int pos_px, int len_bytes) {
+    const int screen_width = ESP32S3_Touch_LCD_7::_width;
 
     // Sprite overlay - draw sprites on top of framebuffer content
     // Sprites are in display coordinates (not affected by scrolling)
@@ -512,7 +877,7 @@ bool IRAM_ATTR bounceBufferFillCallback(esp_lcd_panel_handle_t panel, void *boun
     uint16_t* bounce_buf16 = (uint16_t*)bounce_buf;
 
     for (int spr = 0; spr < SPRITE_MAX_COUNT; spr++) {
-        const Sprite& sprite = display->_active_sprites[spr];
+        const Sprite& sprite = _active_sprites[spr];
 
         // Skip disabled sprites
         if (sprite.yx == SPRITE_DISABLED || sprite.data == nullptr) continue;
@@ -531,11 +896,22 @@ bool IRAM_ATTR bounceBufferFillCallback(esp_lcd_panel_handle_t panel, void *boun
         uint16_t first_color = 0;
         bool collision_detected = false;
 
-        // Calculate sprite's screen Y range
+        // Calculate sprite's logical screen Y range
         const int16_t spr_y_end = spr_y + spr_h - 1;
 
-        // Quick rejection: sprite doesn't overlap chunk's Y range
-        if (spr_y > chunk_end_y || spr_y_end < chunk_start_y) continue;
+        // Physical Y span of this sprite (flipped under 180-degree rotation),
+        // used to reject sprites that don't fall in this (physical) chunk.
+        int16_t phys_y_lo, phys_y_hi;
+        if (_rotate180) {
+            phys_y_lo = ESP32S3_Touch_LCD_7::_height - 1 - spr_y_end;
+            phys_y_hi = ESP32S3_Touch_LCD_7::_height - 1 - spr_y;
+        } else {
+            phys_y_lo = spr_y;
+            phys_y_hi = spr_y_end;
+        }
+
+        // Quick rejection: sprite doesn't overlap this chunk's (physical) Y range
+        if (phys_y_lo > chunk_end_y || phys_y_hi < chunk_start_y) continue;
 
         // Calculate sprite's screen X range (for horizontal bounds)
         const int16_t spr_x_end = spr_x + spr_w - 1;
@@ -545,13 +921,16 @@ bool IRAM_ATTR bounceBufferFillCallback(esp_lcd_panel_handle_t panel, void *boun
 
         // Process each row of the sprite that falls within this chunk
         for (int16_t row = 0; row < spr_h; row++) {
-            int16_t scr_y = spr_y + row;
+            int16_t scr_y = spr_y + row;          // logical screen row
 
-            // Skip rows outside chunk's Y range
-            if (scr_y < chunk_start_y || scr_y > chunk_end_y) continue;
-
-            // Skip rows off-screen
+            // Skip rows off-screen (logical bounds)
             if (scr_y < 0 || scr_y >= ESP32S3_Touch_LCD_7::_height) continue;
+
+            // Physical row this logical row maps to (flipped under 180)
+            int16_t phys_y = _rotate180 ? (ESP32S3_Touch_LCD_7::_height - 1 - scr_y) : scr_y;
+
+            // Skip rows outside this chunk's (physical) Y range
+            if (phys_y < chunk_start_y || phys_y > chunk_end_y) continue;
 
             // Calculate visible X range for this sprite row
             int16_t vis_x_start = (spr_x < 0) ? 0 : spr_x;
@@ -560,25 +939,16 @@ bool IRAM_ATTR bounceBufferFillCallback(esp_lcd_panel_handle_t panel, void *boun
             // Skip if no visible pixels
             if (vis_x_start > vis_x_end) continue;
 
-            // Calculate bounce buffer position for this screen row/col
-            int row_start_px = scr_y * screen_width;  // Start of this screen row in linear coords
-
-            // Only process columns that fall within this chunk
-            int chunk_row_start = row_start_px;
-            int chunk_row_end = row_start_px + screen_width - 1;
-
-            // Clip to actual chunk bounds
-            if (chunk_row_start < chunk_start_px) chunk_row_start = chunk_start_px;
-            if (chunk_row_end > chunk_end_px) chunk_row_end = chunk_end_px;
-
             // For each pixel in the visible sprite row
             for (int16_t scr_x = vis_x_start; scr_x <= vis_x_end; scr_x++) {
-                int linear_pos = scr_y * screen_width + scr_x;
+                // Physical position of this logical pixel (flipped under 180)
+                int16_t phys_x = _rotate180 ? (screen_width - 1 - scr_x) : scr_x;
+                int linear_pos = phys_y * screen_width + phys_x;
 
                 // Check if this pixel is in the current chunk
                 if (linear_pos < chunk_start_px || linear_pos > chunk_end_px) continue;
 
-                // Get sprite pixel
+                // Get sprite pixel (sprite data is addressed in logical space)
                 int spr_px_x = scr_x - spr_x;  // X offset into sprite
                 uint16_t spr_pixel = spr_data[row * spr_w + spr_px_x];
 
@@ -603,34 +973,74 @@ bool IRAM_ATTR bounceBufferFillCallback(esp_lcd_panel_handle_t panel, void *boun
             }
         }
 
-        // Set collision flag if detected (ISR only sets, never clears)
+        // Set collision flag if detected (only sets, never clears)
         if (collision_detected) {
-            display->_sprite_collisions[spr] = 1;
+            _sprite_collisions[spr] = 1;
         }
     }
-
-    // Debug: uncomment to draw a green line on the last scanline of the chunk when
-    // desync is detected. Drawn at the end of the buffer because the DMA reads forward
-    // from the start, so pixels near the beginning may already have been sent.
-    // if (desync) {
-    //     int total_pixels = len_bytes / (int)sizeof(uint16_t);
-    //     int last_line_start = total_pixels - screen_width;
-    //     if (last_line_start < 0) last_line_start = 0;
-    //     uint16_t* indicator = (uint16_t*)bounce_buf + last_line_start;
-    //     uint16_t green = 0x07E0; // RGB565 green
-    //     int count = total_pixels - last_line_start;
-    //     for (int i = 0; i < count; i++) {
-    //         indicator[i] = green;
-    //     }
-    // }
-
-    // Accumulate time spent inside ISR and record exit time
-    uint32_t exit_time = esp_cpu_get_cycle_count();
-    g_isrCyclesIn += (exit_time - entry_time);
-    g_isrLastExit = exit_time;
-
-    return false;
 }
+
+#if LCD7_BOUNCE_FILL_COOP
+// Cooperatively drain the current chunk: claim a block, copy it, advance the
+// shared cursor with a CAS.  A failed CAS means the other core moved the cursor
+// (it's helping / took over) -- we just re-read and keep helping; the loop ends
+// when the cursor reaches the end.  Whoever lands the final advance draws the
+// sprites and clears the active flag.  myGen guards against the chunk rolling
+// over while a stalled worker is still here (it abandons the stale chunk).
+void ESP32S3_Touch_LCD_7::_coopDrive(uint32_t myGen) {
+    if (g_coopGen != myGen) return;
+    CoopChunk c = g_coop;                 // snapshot the chunk params...
+    if (g_coopGen != myGen) return;       // ...and confirm they're still ours
+    const uint32_t end = (uint32_t)c.pixel_count;
+    for (;;) {
+        if (g_coopGen != myGen) return;   // chunk rolled over -> abandon
+        uint32_t p = g_coopCursor.load(std::memory_order_acquire);
+        if (p >= end) break;              // finished by us or the other core
+        uint32_t n = end - p;
+        if (n > (uint32_t)LCD7_COOP_BLOCK_PX) n = (uint32_t)LCD7_COOP_BLOCK_PX;
+        coopCopyBlock(c, (int)p, (int)n);                 // idempotent on overlap
+        uint32_t want = p + n;
+        if (!g_coopCursor.compare_exchange_strong(
+                p, want, std::memory_order_release, std::memory_order_relaxed)) {
+            continue;                     // the other core advanced it -> re-read
+        }
+        if (want >= end) {                // we landed the final block -> finish up
+            _overlaySprites(c.bounce_buf, c.pos_px, c.pixel_count * (int)sizeof(uint16_t));
+            g_coopActive = false;         // stop the checkpoint timer acting on this chunk
+            break;
+        }
+    }
+}
+
+// Core-0 (PRO/WiFi core), LOW priority: opportunistic worker.  Runs the chunk
+// cooperatively when it qualifies, else does the whole fill itself.
+void ESP32S3_Touch_LCD_7::_coopWorkerTask(void* arg) {
+    ESP32S3_Touch_LCD_7* self = (ESP32S3_Touch_LCD_7*)arg;
+    BounceFillRequest req;
+    for (;;) {
+        if (xQueueReceive(self->_bounceQueue, &req, portMAX_DELAY) == pdTRUE) {
+            bool coop_ok = (req.scroll_offset == 0) &&
+                           (self->_fb_stride == ESP32S3_Touch_LCD_7::_width);
+            if (coop_ok) {
+                self->_coopDrive(req.gen);
+            } else {
+                self->_fillBounceBuffer(req.bounce_buf, req.pos_px, req.len_bytes,
+                                        req.framebuffer, req.scroll_offset);
+            }
+        }
+    }
+}
+
+// Core-1 (app core), HIGH priority: backstop.  Woken by the checkpoint timer only
+// when the worker has fallen behind; finishes the remainder of the live chunk.
+void ESP32S3_Touch_LCD_7::_coopBackstopTask(void* arg) {
+    ESP32S3_Touch_LCD_7* self = (ESP32S3_Touch_LCD_7*)arg;
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        self->_coopDrive(g_coopGen);      // help whatever chunk is current
+    }
+}
+#endif // LCD7_BOUNCE_FILL_COOP
 
 ESP32S3_Touch_LCD_7::ESP32S3_Touch_LCD_7(ESP32S3_Touch_LCD_7_Board& board,
                                          uint16_t fb_pad_x, uint16_t fb_pad_y)
@@ -717,7 +1127,13 @@ void ESP32S3_Touch_LCD_7::setActiveFramebuffer(uint8_t index, bool wait) {
     }
 }
 
-bool ESP32S3_Touch_LCD_7::begin(uint32_t pclk_hz) {
+bool ESP32S3_Touch_LCD_7::begin(uint32_t pclk_hz, uint16_t rotation) {
+    // Latch the rotation for the lifetime of the driver.  Normalize index
+    // aliases (1/2/3 -> 90/180/270) first; only 180 flips here.  90/270 are not
+    // handled by the driver -- they belong at the LVGL->framebuffer level.
+    rotation = cglcd7_normalize_rotation(rotation);
+    _rotate180 = (rotation == 180);
+
     // Bring up the board's shared I2C bus + CH422G expander first: on this board
     // the ST7262's reset and the LCD backlight live on the expander.
     // (Idempotent -- touch.begin() may also call it.)
@@ -807,27 +1223,80 @@ bool ESP32S3_Touch_LCD_7::begin(uint32_t pclk_hz) {
         return false;
     }
 
-    // --- Begin desync detection setup (removable if ESP-IDF fixes bounce buffer phasing) ---
-    // Extract the GDMA channel from the panel's internal struct so we can cache a pointer
-    // to the hardware register (out.dscr) that reveals which buffer the DMA is reading from.
-    {
-        esp_rgb_panel_partial_t* rgb_panel = (esp_rgb_panel_partial_t*)_panel_handle;
-        gdma_channel_handle_t dma_chan = rgb_panel->dma_chan;
-        int group_id = -1, channel_id = -1;
-        if (gdma_get_group_channel_id(dma_chan, &group_id, &channel_id) == ESP_OK) {
-            gdma_dev_t* gdma_hw = GDMA_LL_GET_HW(group_id);
-            if (gdma_hw != nullptr) {
-                s_gdma_out_dscr_reg = &gdma_hw->channel[channel_id].out.dscr;
-                Serial.printf("Desync detection: GDMA group=%d ch=%d, out.dscr @%p\n",
-                              group_id, channel_id, s_gdma_out_dscr_reg);
-            }
-        } else {
-            Serial.printf("Desync detection: gdma_get_group_channel_id failed (dma_chan=%p)\n", dma_chan);
+#if LCD7_BOUNCE_FILL_IN_TASK
+    // Move the PSRAM->bounce-buffer copy into a high-priority task so the GDMA ISR
+    // stays short (it only latches frame state and hands off the request).  This
+    // is ON by default: the task's cached CPU copy meets the per-bounce-buffer
+    // (~1 ms) deadline comfortably (0 drops in testing).  Set LCD7_BOUNCE_FILL_IN_TASK
+    // to 0 to copy inline in the ISR instead (like the 2.8C driver), which is also
+    // the automatic fallback if the task/queue can't be created.
+    //
+    // Created BEFORE refresh starts.  By default pinned to the core running
+    // begin() -- the same core the GDMA ISR runs on -- so the hand-off is a
+    // same-core wakeup; LCD7_BOUNCE_FILL_OTHER_CORE moves it to the other core.
+    // If creation fails, _bounceQueue stays null and the ISR copies inline.
+    BaseType_t fill_core = xPortGetCoreID();
+#if LCD7_BOUNCE_FILL_OTHER_CORE
+    fill_core ^= 1;   // pin to the opposite core (off the LVGL/UI core)
+#endif
+    _bounceQueue = xQueueCreate(LCD7_BOUNCE_QUEUE_LEN, sizeof(BounceFillRequest));
+    if (_bounceQueue != nullptr) {
+#if LCD7_BOUNCE_FILL_COOP
+        // Cooperative dual-core fill: a low-priority worker on the OTHER (PRO/WiFi)
+        // core, a high-priority backstop on the app core, and a checkpoint timer
+        // that wakes the backstop if the worker stalls.  See the COOP block above.
+        g_coopThreshCycles = (uint32_t)LCD7_COOP_CHECKPOINT_US * (uint32_t)getCpuFrequencyMhz();
+        BaseType_t appCore   = xPortGetCoreID();
+        BaseType_t otherCore = appCore ^ 1;
+        BaseType_t okW = xTaskCreatePinnedToCore(
+            _coopWorkerTask, "lcd7_bbcoop0", 4096, this,
+            LCD7_COOP_WORKER_PRIORITY, &_bounceTask, otherCore);
+        BaseType_t okB = xTaskCreatePinnedToCore(
+            _coopBackstopTask, "lcd7_bbcoop1", 4096, this,
+            LCD7_BOUNCE_TASK_PRIORITY, &g_coopBackstop, appCore);
+        bool timerOk = false;
+        gptimer_config_t tcfg = {};
+        tcfg.clk_src = GPTIMER_CLK_SRC_DEFAULT;
+        tcfg.direction = GPTIMER_COUNT_UP;
+        tcfg.resolution_hz = 1000000;   // 1 tick = 1 us
+        if (gptimer_new_timer(&tcfg, &g_coopTimer) == ESP_OK) {
+            gptimer_event_callbacks_t tcbs = {};
+            tcbs.on_alarm = coopTimerCb;
+            gptimer_alarm_config_t acfg = {};
+            acfg.reload_count = 0;
+            acfg.alarm_count = LCD7_COOP_TICK_US;
+            acfg.flags.auto_reload_on_alarm = true;
+            timerOk = (gptimer_register_event_callbacks(g_coopTimer, &tcbs, nullptr) == ESP_OK) &&
+                      (gptimer_set_alarm_action(g_coopTimer, &acfg) == ESP_OK) &&
+                      (gptimer_enable(g_coopTimer) == ESP_OK) &&
+                      (gptimer_start(g_coopTimer) == ESP_OK);
         }
-        // Bounce buffer size in bytes
-        s_bb_size = panel_config.bounce_buffer_size_px * sizeof(uint16_t);
+        if (okW != pdPASS || okB != pdPASS || !timerOk) {
+            Serial.println("Cooperative fill setup failed; falling back to single task");
+            // Best-effort fallback to the normal single fill task on the app core.
+            if (g_coopBackstop) { vTaskDelete(g_coopBackstop); g_coopBackstop = nullptr; }
+            if (_bounceTask)    { vTaskDelete(_bounceTask);    _bounceTask = nullptr; }
+            if (g_coopTimer)    { gptimer_del_timer(g_coopTimer); g_coopTimer = nullptr; }
+            if (xTaskCreatePinnedToCore(_bounceFillTask, "lcd7_bbfill", 4096, this,
+                    LCD7_BOUNCE_TASK_PRIORITY, &_bounceTask, fill_core) != pdPASS) {
+                vQueueDelete(_bounceQueue);
+                _bounceQueue = nullptr;   // ISR will copy inline
+            }
+        }
+#else
+        BaseType_t ok = xTaskCreatePinnedToCore(
+            _bounceFillTask, "lcd7_bbfill", 4096, this,
+            LCD7_BOUNCE_TASK_PRIORITY, &_bounceTask, fill_core);
+        if (ok != pdPASS) {
+            Serial.println("Bounce-fill task creation failed; copying inline in the ISR");
+            vQueueDelete(_bounceQueue);
+            _bounceQueue = nullptr;
+        }
+#endif
+    } else {
+        Serial.println("Bounce-fill queue creation failed; copying inline in the ISR");
     }
-    // --- End desync detection setup ---
+#endif
 
     // Register bounce buffer callback BEFORE init (when refresh starts)
     // With no_fb=true, the callback will be invoked to fill bounce buffers
@@ -851,6 +1320,34 @@ bool ESP32S3_Touch_LCD_7::begin(uint32_t pclk_hz) {
         Serial.printf("Failed to init panel: %d\n", ret);
         return false;
     }
+
+#if LCD7_BOUNCE_DESYNC_WORKAROUND
+    // --- Desync detection setup --- (see extras/DESYNC_WORKAROUND.md)
+    // Extract the GDMA channel from the panel's internal struct so we can cache a
+    // pointer to the hardware register (out.dscr) that reveals which buffer the
+    // DMA is reading from.  NOTE on timing: historically this ran right after
+    // esp_lcd_new_rgb_panel() and worked; on ESP-IDF 5.5.4 dma_chan was null both
+    // there AND here (after init), i.e. the esp_rgb_panel_partial_t offset no
+    // longer matches -- re-derive it for your IDF (see the doc) before trusting
+    // this.  The bounce callback guards on s_gdma_out_dscr_reg/s_bb_size.
+    {
+        esp_rgb_panel_partial_t* rgb_panel = (esp_rgb_panel_partial_t*)_panel_handle;
+        gdma_channel_handle_t dma_chan = rgb_panel->dma_chan;
+        int group_id = -1, channel_id = -1;
+        if (gdma_get_group_channel_id(dma_chan, &group_id, &channel_id) == ESP_OK) {
+            gdma_dev_t* gdma_hw = GDMA_LL_GET_HW(group_id);
+            if (gdma_hw != nullptr) {
+                s_gdma_out_dscr_reg = &gdma_hw->channel[channel_id].out.dscr;
+                Serial.printf("Desync detection: GDMA group=%d ch=%d, out.dscr @%p\n",
+                              group_id, channel_id, s_gdma_out_dscr_reg);
+            }
+        } else {
+            Serial.printf("Desync detection: gdma_get_group_channel_id failed (dma_chan=%p)\n", dma_chan);
+        }
+        s_bb_size = panel_config.bounce_buffer_size_px * sizeof(uint16_t);
+    }
+    // --- End desync detection setup ---
+#endif // LCD7_BOUNCE_DESYNC_WORKAROUND
 
     // If PSRAM allocation failed, prefill both bounce buffers with the
     // "MUST ENABLE PSRAM" error message. The DMA will cycle these forever

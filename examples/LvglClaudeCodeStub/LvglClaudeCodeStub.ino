@@ -61,7 +61,9 @@ void setup() {
     // and "USB CDC On Boot" must be enabled to see anything
     Serial0.begin(115200);
 
-    // Initialize display, touch, and LVGL
+    // Initialize display, touch, and LVGL.
+    // Rotation: lv_setup.begin(180) for an upside-down panel, or begin(90) /
+    // begin(270) for portrait (480x800).  See the README.
     lv_setup.begin();
     Serial0.printf("LVGL initialized with %dx%d touchscreen\n", display.width(), display.height());
 

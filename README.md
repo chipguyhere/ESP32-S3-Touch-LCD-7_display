@@ -167,8 +167,28 @@ What the header provides:
   display and touch resets and switch the backlight on — you don't touch any of
   that. After this returns, the active LVGL screen exists and you build your UI
   with ordinary LVGL calls.
+- **`lv_setup.begin(180)`** — same, but for a panel **mounted upside-down**.
+  Pass `180` and both the image and the touch are flipped 180° for you (the
+  display flip happens in the driver, still reading PSRAM forward/sequentially, so
+  there's no meaningful performance cost; sprites and the flash-write overlay flip
+  too). `0` (the default) is normal orientation.
+- **`lv_setup.begin(90)` / `lv_setup.begin(270)`** — **portrait** (480×800).
+  90° and 270° can't be done in the driver's framebuffer read without slow
+  vertical-stripe access, so they're handled one level up: LVGL renders in
+  **PARTIAL** mode in portrait, and the flush callback rotates each changed
+  region into the landscape framebuffers, keeping the two buffers in sync with a
+  deferred dirty-rectangle scheme (it never copies pixels that the next frame is
+  about to overwrite — e.g. while scrolling). The driver itself still reads PSRAM
+  forward. Touch is mapped to match. This mode costs one extra **internal-SRAM**
+  draw band (≈80 KB, `LV_SETUP_ROT_BAND_BYTES` in `lv_setup.hpp`); a bigger band
+  means longer contiguous PSRAM writes during the rotate. In portrait,
+  `lv_display_get_horizontal_resolution()` reports 480 and the vertical 800. If
+  the image/touch come out the wrong way round, swap 90 and 270.
+
+  *The index aliases `1`/`2`/`3` are accepted everywhere as `90`/`180`/`270` —
+  e.g. `lv_setup.begin(1)` is the same as `lv_setup.begin(90)`.*
 - **`display`** — a global `ESP32S3_Touch_LCD_7` display object. Handy methods:
-  `display.width()`, `display.height()` (800×480), and
+  `display.width()`, `display.height()` (always the physical 800×480), and
   `display.setBacklight(true/false)` to switch the backlight on or off.
 
 You don't render or flush anything yourself — LVGL renders straight into the

@@ -19,6 +19,9 @@
 #include <Arduino.h>
 #include "esp_lcd_panel_io.h"
 #include <ESP32S3_Touch_LCD_7_Board.h>   // shared I2C bus + expander (RST/BL)
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
 
 // This display requires PSRAM for its framebuffers (two 800x480 RGB565 buffers,
 // ~768 KB each). The Arduino ESP32 core defines BOARD_HAS_PSRAM only when PSRAM
@@ -58,6 +61,18 @@ struct Sprite {
 
 
 
+// Normalize a rotation argument to degrees.  Accepts degrees (0/90/180/270)
+// directly, and the index aliases 1/2/3 as 90/180/270 respectively.  Anything
+// else passes through unchanged (treated as no rotation downstream).
+static inline uint16_t cglcd7_normalize_rotation(uint16_t rotation) {
+    switch (rotation) {
+        case 1: return 90;
+        case 2: return 180;
+        case 3: return 270;
+        default: return rotation;
+    }
+}
+
 class ESP32S3_Touch_LCD_7 {
 public:
     // Constructor.  Takes the board that owns the shared I2C bus and the
@@ -66,8 +81,13 @@ public:
     ESP32S3_Touch_LCD_7(ESP32S3_Touch_LCD_7_Board& board,
                         uint16_t fb_pad_x = 20, uint16_t fb_pad_y = 60);
 
-    // Initialize the display
-    bool begin(uint32_t pclk_hz = 16000000);
+    // Initialize the display.
+    // rotation: 0 = normal, 180 = flipped (for a panel mounted upside-down).
+    //           The index aliases 1/2/3 are accepted for 90/180/270.  Only 0 and
+    //           180 are handled here; 90/270 are intended to be done at the
+    //           LVGL->framebuffer level (so the driver keeps reading the
+    //           framebuffer forward/sequentially), not by this driver.
+    bool begin(uint32_t pclk_hz = 16000000, uint16_t rotation = 0);
     // 21000000 is near the practical upper limit for this panel/timing
     // 16000000 is Waveshare's default for the ST7262 800x480 panel
     //  Lower pclk reduces ISR/bus load at the cost of refresh rate
@@ -199,9 +219,42 @@ private:
     // Friend function for bounce buffer callback (needs access to scroll offsets)
     friend bool bounceBufferFillCallback(esp_lcd_panel_handle_t, void*, int, int, void*);
 
+    // The heavy PSRAM->bounce-buffer copy (and sprite overlay) runs in a
+    // dedicated high-priority task instead of the GDMA ISR, so the ISR stays
+    // short and does not block other interrupts on its core.  The ISR
+    // (bounceBufferFillCallback) still does the cheap, time-critical work --
+    // frame-start latching, the desync detection/redirect, and the flash-overlay
+    // fill -- then hands the chosen buffer to this task via _bounceQueue.
+    // _bounceFillTask drains the queue and performs the copy.
+    static void _bounceFillTask(void* arg);
+    void _fillBounceBuffer(void* bounce_buf, int pos_px, int len_bytes,
+                           uint16_t* framebuffer, uint32_t scroll_offset);
+    // Sprite overlay, factored out of _fillBounceBuffer.
+    void _overlaySprites(void* bounce_buf, int pos_px, int len_bytes);
+    QueueHandle_t _bounceQueue = nullptr;   // ISR -> fill-task hand-off
+    TaskHandle_t  _bounceTask  = nullptr;   // the high-priority fill task
+
+    // Cooperative dual-core fill (LCD7_BOUNCE_FILL_COOP, opt-in).  A low-priority
+    // worker on the WiFi/PRO core does the copy opportunistically; a checkpoint
+    // timer lets a high-priority backstop on the app core finish the remainder if
+    // the worker stalled.  Both advance one shared atomic cursor over the chunk,
+    // so overlapping copies are the harmless idempotent same-src->same-dst writes.
+    // (Definitions are compiled only when the flag is on; declared here always so
+    // the header needs no knowledge of the flag.)
+    void _coopDrive(uint32_t myGen);          // claim+copy blocks until chunk done
+    static void _coopWorkerTask(void* arg);   // core 0, low priority
+    static void _coopBackstopTask(void* arg); // core 1, high priority (timer-woken)
+
     // Display properties (visible screen size)
     static const uint16_t _width = 800;
     static const uint16_t _height = 480;
+
+    // 180-degree rotation, fixed at begin().  When true, the bounce-buffer fill
+    // presents physical pixel p as logical pixel (_width*_height - 1 - p): the
+    // PSRAM framebuffer is still read forward/sequentially, but written into the
+    // SRAM bounce buffer backward.  Sprites and the flash-write overlay are
+    // flipped to match.  Immutable after begin(), so it needs no latching.
+    bool _rotate180 = false;
 
     // Bounce buffer size in pixels.  The ESP32-S3 RGB driver streams the
     // framebuffer through two SRAM bounce buffers; this is the size of each.
@@ -263,6 +316,7 @@ extern volatile uint64_t g_isrCyclesIn;   // Total cycles spent inside callback
 extern volatile uint64_t g_isrCyclesOut;  // Total cycles spent outside callback
 extern volatile uint32_t g_isrCallCount;  // Number of callback invocations
 extern volatile uint32_t g_bbDesyncCount; // Number of bounce buffer desync events detected
+extern volatile uint32_t g_bbDroppedCount;// Fill requests dropped because the fill task could not keep up (queue full)
 
 // Diagnostic: last GDMA state seen by ISR (for debugging desync detection)
 extern volatile uint32_t g_bbDiag_dscr;      // Last descriptor address from GDMA out.dscr
